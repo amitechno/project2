@@ -1,0 +1,24 @@
+[
+	{
+		"ParameterKey": "EnvironmentName",
+		"ParameterValue": "UdacityProject"
+	},
+	{
+		"ParameterKey": "AMIID",
+		"ParameterValue": "ami-05548f9cecf47b442"
+	},
+	{
+		"ParameterKey": "MinSize",
+		"ParameterValue": "3"
+	  },
+	  {
+		"ParameterKey": "MaxSize",
+		"ParameterValue": "3"
+	  },
+	  {
+		"ParameterKey": "SSHLocation",
+		"ParameterValue": "203.0.113.5/32"
+	  }
+
+	  
+]

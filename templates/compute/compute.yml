@@ -1,0 +1,286 @@
+Description: >
+    Amit Sharma / Udacity 2023
+
+Parameters:
+
+    EnvironmentName:
+        Description: An environment name that will be prefixed to resource names
+        Type: String
+
+    AMIID:
+        Description: The AMI ID
+        Type: AWS::EC2::Image::Id
+    
+    MinSize:
+        Description: Minimum number of instances in the Auto Scaling Group
+        Type: Number
+        Default: 3
+
+    MaxSize:
+        Description: Maximum number of instances in the Auto Scaling Group
+        Type: Number
+        Default: 3
+    
+    SSHLocation:
+        Description: The IP address range that can be used to SSH to the bastion host
+        Type: String
+        MinLength: '9'
+        MaxLength: '18'
+        Default: '0.0.0.0/0'
+        AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+        ConstraintDescription: Must be a valid IP CIDR range of the form x.x.x.x/x
+
+
+Resources:
+
+  ProfileWithRolesForOurApp:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - S3AccessEC2Role
+  
+  S3AccessLogsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: 150680820460-my-access-logs-bucket
+        AccessControl: Private
+        LifecycleConfiguration:
+          Rules:
+            - ExpirationInDays: 365
+              Status: Enabled
+        Tags:
+          - Key: Name
+            Value: AccessLogsBucket
+    
+  S3AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - arn:aws:iam::127311923021:root
+                - arn:aws:iam::033677994240:root
+                - arn:aws:iam::797873946194:root
+            Action:
+              - s3:PutObject
+              - s3:ListBucket
+            Resource: 
+              - !Sub "arn:aws:s3:::${S3AccessLogsBucket}"
+              - !Sub "arn:aws:s3:::${S3AccessLogsBucket}/*"
+
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our load balancer
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: 0.0.0.0/0
+
+  WebServerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our hosts and SSH from local only
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535
+        CidrIp: 0.0.0.0/0
+
+  WebAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y
+          sudo yum install httpd -y
+          sudo sed -i 's/Listen 80/Listen 8080/g' /etc/httpd/conf/httpd.conf
+          sudo systemctl start httpd
+          sudo systemctl enable httpd
+          echo "it works! Udagram, Udacity" | sudo tee /var/www/html/index.html        
+      ImageId: !Ref AMIID
+      SecurityGroups:
+      - Ref: WebServerSecGroup
+      InstanceType: t3.medium
+      BlockDeviceMappings:
+      - DeviceName: "/dev/sdk"
+        Ebs:
+          VolumeSize: '10'
+  WebAppGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Fn::ImportValue: 
+          !Sub "${EnvironmentName}-PRIV-NETS"
+      LaunchConfigurationName:
+        Ref: WebAppLaunchConfig
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      TargetGroupARNs:
+      - Ref: WebAppTargetGroup
+
+  WebAppLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+      - Ref: LBSecGroup
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref S3AccessLogsBucket
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: WebAppTargetGroup
+      LoadBalancerArn:
+        Ref: WebAppLB
+      Port: '80'
+      Protocol: HTTP
+
+  ALBListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'WebAppTargetGroup'
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref 'Listener'
+        Priority: 1
+
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      Port: 8080
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: 
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPCID"
+  
+  S3AccessEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: S3AccessEC2Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: UdacitySPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource: '*'
+
+  BastionHostSecGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Allow SSH from your IP to the bastion host
+        VpcId:
+          Fn::ImportValue:
+            !Sub "${EnvironmentName}-VPCID"
+        SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      SecurityGroupIds:
+        - !GetAtt LBSecGroup.GroupId
+      KeyName: private-server
+      ImageId: !Ref AMIID
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum install httpd -y
+          systemctl start httpd
+          systemctl enable httpd
+      Tags:
+        - Key: Name
+          Value: BastionHost
+      SubnetId:
+        Fn::ImportValue:
+          !Sub ${EnvironmentName}-PUB1-SN
+
+
+
+  BastionEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  BastionEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref BastionHost
+      EIP: !Ref BastionEIP
+  
+Outputs:
+  WebAppLoadBalancerDNS:
+      Description: DNS name of the load balancer
+      Value: !GetAtt WebAppLB.DNSName
+      Export:
+          Name: !Sub ${EnvironmentName}-LoadBalancerDNS
+  
+  BastionHostPublicIP:
+    Description: Public IP address of the bastion host
+    Value: !GetAtt BastionHost.PublicIp
+    Export:
+      Name: !Sub "${EnvironmentName}-BastionHostPublicIP"
